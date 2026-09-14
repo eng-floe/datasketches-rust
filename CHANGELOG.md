@@ -4,6 +4,10 @@ All significant changes to this project will be documented in this file.
 
 ## Unreleased
 
+### New features
+
+* `TDigestMut::update_with_weight` adds repeated observations without expanding them into individual updates.
+
 ## v0.5.0
 
 ### Breaking changes

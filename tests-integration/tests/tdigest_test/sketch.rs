@@ -17,6 +17,7 @@
 
 use std::mem::size_of;
 
+use datasketches::error::ErrorKind;
 use datasketches::tdigest::TDigestMut;
 use googletest::assert_that;
 use googletest::prelude::eq;
@@ -66,6 +67,77 @@ fn test_one_value() {
     assert_eq!(tdigest.quantile(0.0), Some(1.0));
     assert_eq!(tdigest.quantile(0.5), Some(1.0));
     assert_eq!(tdigest.quantile(1.0), Some(1.0));
+}
+
+#[test]
+fn test_weighted_updates() {
+    let mut weighted = TDigestMut::new(100).unwrap();
+    let mut repeated = TDigestMut::new(100).unwrap();
+    for (value, weight) in [(1.0, 10), (2.0, 20), (3.0, 30)] {
+        weighted.update_with_weight(value, weight).unwrap();
+        for _ in 0..weight {
+            repeated.update(value);
+        }
+    }
+
+    assert_eq!(weighted.total_weight(), repeated.total_weight());
+    assert_eq!(weighted.min_value(), repeated.min_value());
+    assert_eq!(weighted.max_value(), repeated.max_value());
+    for (value, expected_rank) in [(1.0, 1.0 / 12.0), (2.0, 1.0 / 3.0), (3.0, 0.75)] {
+        assert_that!(weighted.rank(value).unwrap(), near(expected_rank, 1e-12));
+    }
+    let mut previous = weighted.min_value().unwrap();
+    for rank in [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] {
+        let quantile = weighted.quantile(rank).unwrap();
+        assert!((previous..=weighted.max_value().unwrap()).contains(&quantile));
+        previous = quantile;
+    }
+
+    let bytes = weighted.serialize();
+    let decoded = TDigestMut::deserialize(&bytes).unwrap();
+    assert_eq!(decoded.total_weight(), 60);
+    assert_eq!(decoded.min_value(), Some(1.0));
+    assert_eq!(decoded.max_value(), Some(3.0));
+}
+
+#[test]
+fn test_weighted_update_noops_and_overflow() {
+    let mut tdigest = TDigestMut::new(100).unwrap();
+    tdigest.update_with_weight(1.0, 0).unwrap();
+    tdigest.update_with_weight(f64::NAN, 10).unwrap();
+    tdigest.update_with_weight(f64::INFINITY, 10).unwrap();
+    assert!(tdigest.is_empty());
+
+    tdigest.update_with_weight(2.0, u64::MAX).unwrap();
+    let error = tdigest.update_with_weight(3.0, 1).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert_eq!(tdigest.total_weight(), u64::MAX);
+    assert_eq!(tdigest.min_value(), Some(2.0));
+    assert_eq!(tdigest.max_value(), Some(2.0));
+}
+
+#[test]
+fn test_weighted_updates_survive_compression_merge_and_serde() {
+    let mut left = TDigestMut::new(10).unwrap();
+    for value in 0..250 {
+        left.update_with_weight(f64::from(value), 3).unwrap();
+    }
+    assert_eq!(left.total_weight(), 750);
+
+    let mut right = TDigestMut::new(10).unwrap();
+    for value in 250..350 {
+        right.update_with_weight(f64::from(value), 5).unwrap();
+    }
+    left.merge(&right);
+    assert_eq!(left.total_weight(), 1_250);
+    assert_eq!(left.min_value(), Some(0.0));
+    assert_eq!(left.max_value(), Some(349.0));
+
+    let bytes = left.serialize();
+    let decoded = TDigestMut::deserialize(&bytes).unwrap();
+    assert_eq!(decoded.total_weight(), 1_250);
+    assert_eq!(decoded.min_value(), Some(0.0));
+    assert_eq!(decoded.max_value(), Some(349.0));
 }
 
 #[test]
