@@ -117,6 +117,47 @@ fn test_weighted_update_noops_and_overflow() {
 }
 
 #[test]
+fn test_sorted_weighted_run() {
+    let mut tdigest = TDigestMut::new(10).unwrap();
+    tdigest.update_with_weight(-1.0, 2).unwrap();
+    tdigest
+        .update_sorted_with_weights(&[
+            (0.0, 0),
+            (1.0, 10),
+            (2.0, 20),
+            (3.0, 30),
+            (f64::NAN, 10),
+        ])
+        .unwrap();
+
+    assert_eq!(tdigest.total_weight(), 62);
+    assert_eq!(tdigest.min_value(), Some(-1.0));
+    assert_eq!(tdigest.max_value(), Some(3.0));
+    assert_that!(tdigest.rank(2.0).unwrap(), near(22.0 / 62.0, 1e-12));
+    let decoded = TDigestMut::deserialize(&tdigest.serialize()).unwrap();
+    assert_eq!(decoded.total_weight(), 62);
+}
+
+#[test]
+fn test_sorted_weighted_run_rejects_unsorted_values_and_overflow() {
+    let mut tdigest = TDigestMut::new(10).unwrap();
+    let error = tdigest
+        .update_sorted_with_weights(&[(2.0, 1), (1.0, 1)])
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert!(tdigest.is_empty());
+
+    tdigest
+        .update_sorted_with_weights(&[(1.0, u64::MAX)])
+        .unwrap();
+    let error = tdigest
+        .update_sorted_with_weights(&[(2.0, 1)])
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert_eq!(tdigest.total_weight(), u64::MAX);
+}
+
+#[test]
 fn test_weighted_updates_survive_compression_merge_and_serde() {
     let mut left = TDigestMut::new(10).unwrap();
     for value in 0..250 {

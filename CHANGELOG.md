@@ -12,6 +12,7 @@ All significant changes to this project will be documented in this file.
 
 * Add KLL sketches behind the `kll` feature, with rank, quantile, PMF, and CDF queries, merging, totally ordered custom item types, a `KllFloat` adapter for non-NaN floating-point values, and serialization.
 * `TDigestMut::update_with_weight` adds repeated observations without expanding them into individual updates.
+* `TDigestMut::update_sorted_with_weights` merges and compresses a pre-sorted weighted run without repeated update-buffer sorting.
 
 ### Improvements
 

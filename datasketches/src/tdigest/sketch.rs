@@ -362,6 +362,68 @@ impl TDigestMut {
         Ok(())
     }
 
+    /// Updates this t-digest from values already sorted by nondecreasing value.
+    ///
+    /// Each finite value with a nonzero weight becomes one input centroid. Supplying one sorted
+    /// run lets the digest merge and compress the entire run once instead of sorting and
+    /// compressing each time the ordinary update buffer fills.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when finite, nonzero-weight values are not sorted or their weights would
+    /// overflow the total weight.
+    pub fn update_sorted_with_weights(
+        &mut self,
+        values: &[(f64, u64)],
+    ) -> Result<(), Error> {
+        let mut centroids = Vec::with_capacity(values.len());
+        let mut additional_weight = 0_u64;
+        let mut previous = None;
+        let mut incoming_min = f64::INFINITY;
+        let mut incoming_max = f64::NEG_INFINITY;
+        for &(value, weight) in values {
+            let Some(weight) = NonZeroU64::new(weight) else {
+                continue;
+            };
+            if !value.is_finite() {
+                continue;
+            }
+            if previous.is_some_and(|previous| value < previous) {
+                return Err(Error::invalid_argument(
+                    "t-digest sorted update values must be nondecreasing",
+                ));
+            }
+            previous = Some(value);
+            additional_weight = additional_weight
+                .checked_add(weight.get())
+                .ok_or_else(|| Error::invalid_argument("t-digest total weight overflow"))?;
+            incoming_min = incoming_min.min(value);
+            incoming_max = incoming_max.max(value);
+            centroids.push(Centroid {
+                mean: value,
+                weight,
+            });
+        }
+        if centroids.is_empty() {
+            return Ok(());
+        }
+        self.total_weight()
+            .checked_add(additional_weight)
+            .ok_or_else(|| Error::invalid_argument("t-digest total weight overflow"))?;
+
+        let self_unmerged_weight = self.buffer.unmerged_weight();
+        let centroids = if self.buffer.is_empty() {
+            centroids
+        } else {
+            let incoming = TDigestBuffer::new(centroids, 0, 0);
+            std::mem::take(&mut self.buffer).into_merged_centroids(&incoming)
+        };
+        self.min = self.min.min(incoming_min);
+        self.max = self.max.max(incoming_max);
+        self.compress_sorted_centroids(centroids, self_unmerged_weight + additional_weight);
+        Ok(())
+    }
+
     fn update_nonzero(&mut self, value: f64, weight: NonZeroU64) {
         let max_unmerged = self.max_unmerged();
         if self.buffer.unmerged_len() >= max_unmerged {
