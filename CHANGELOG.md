@@ -11,6 +11,7 @@ All significant changes to this project will be documented in this file.
 ### New features
 
 * Add KLL sketches behind the `kll` feature, with rank, quantile, PMF, and CDF queries, merging, totally ordered custom item types, a `KllFloat` adapter for non-NaN floating-point values, and serialization.
+* `TDigestMut::update_with_weight` adds repeated observations without expanding them into individual updates.
 
 ### Improvements
 
@@ -18,6 +19,7 @@ All significant changes to this project will be documented in this file.
 * Improve truncated-input diagnostics across sketch deserializers.
 * Improve hash-backed sketch update performance for integer and raw-byte inputs.
 * Improve Bloom filter membership-and-insert performance and simplify Theta-family hash table thresholds.
+* T-Digest update workloads with an existing compressed prefix sort only newly buffered centroids while preserving serialized output compatibility.
 
 ### Bug fixes
 

@@ -44,21 +44,24 @@ const INITIAL_UNMERGED_CAPACITY: usize = 8;
 /// Default weight for single values.
 const DEFAULT_WEIGHT: NonZeroU64 = NonZeroU64::new(1).unwrap();
 
-// Centroids are stored as `[compressed prefix | unmerged unit-weight tail]`. Carrying a unit weight
-// for each unmerged value lets updates, compression, and merge reuse one allocation instead of
-// converting raw values into a second vector during compression.
+// Centroids are stored as `[compressed prefix | unmerged tail]`. Carrying the weight with each
+// unmerged value lets unit and weighted updates, compression, and merge reuse one allocation
+// instead of converting raw values into a second vector during compression.
 #[derive(Debug, Clone, Default)]
 struct TDigestBuffer {
     centroids: Vec<Centroid>,
     unmerged_tail_len: usize,
+    unmerged_weight: u64,
 }
 
 impl TDigestBuffer {
-    fn new(centroids: Vec<Centroid>, unmerged_tail_len: usize) -> Self {
+    fn new(centroids: Vec<Centroid>, unmerged_tail_len: usize, unmerged_weight: u64) -> Self {
         debug_assert!(unmerged_tail_len <= centroids.len());
+        debug_assert_eq!(unmerged_tail_len == 0, unmerged_weight == 0);
         TDigestBuffer {
             centroids,
             unmerged_tail_len,
+            unmerged_weight,
         }
     }
 
@@ -74,11 +77,15 @@ impl TDigestBuffer {
         self.unmerged_tail_len
     }
 
+    fn unmerged_weight(&self) -> u64 {
+        self.unmerged_weight
+    }
+
     fn compressed_prefix_len(&self) -> usize {
         self.centroids.len() - self.unmerged_tail_len
     }
 
-    fn push_unmerged(&mut self, value: f64, max_unmerged: usize) {
+    fn push_unmerged(&mut self, value: f64, weight: NonZeroU64, max_unmerged: usize) {
         debug_assert!(self.unmerged_tail_len < max_unmerged);
         if self.centroids.len() == self.centroids.capacity() {
             let target_unmerged = if self.unmerged_tail_len == 0 {
@@ -100,19 +107,56 @@ impl TDigestBuffer {
 
         self.centroids.push(Centroid {
             mean: value,
-            weight: DEFAULT_WEIGHT,
+            weight,
         });
         self.unmerged_tail_len += 1;
+        self.unmerged_weight = self
+            .unmerged_weight
+            .checked_add(weight.get())
+            .expect("t-digest total weight overflow");
     }
 
-    /// Returns all centroids in the tie order expected by stable compression sorting.
+    /// Returns all centroids in stable mean order for compression.
     ///
-    /// The buffer is rotated from `[compressed | unmerged]` to `[unmerged | compressed]`, so new
-    /// values stay before existing centroids when their means are equal.
-    fn into_centroids_for_compression(mut self) -> Vec<Centroid> {
+    /// Only the unmerged tail needs sorting. The compressed prefix is already sorted, so merging
+    /// the two runs avoids sorting the full buffer again. New values precede existing centroids
+    /// when their means are equal, matching a stable full sort of `[unmerged | compressed]`.
+    fn into_sorted_centroids_for_compression(mut self) -> Vec<Centroid> {
         debug_assert_ne!(self.unmerged_tail_len, 0);
         let compressed_prefix_len = self.compressed_prefix_len();
-        self.centroids.rotate_left(compressed_prefix_len);
+        if compressed_prefix_len == 0 {
+            self.centroids.sort_by(centroid_cmp);
+            return self.centroids;
+        }
+
+        self.centroids[compressed_prefix_len..].sort_by(centroid_cmp);
+        let compressed = self.centroids[..compressed_prefix_len].to_vec();
+        let mut compressed_index = 0;
+        let mut unmerged_index = compressed_prefix_len;
+        let mut output_index = 0;
+        let len = self.centroids.len();
+
+        // The compressed prefix is copied, so the merged output can be written forward into its
+        // old storage without overwriting an unread unmerged value.
+        while compressed_index < compressed.len() && unmerged_index < len {
+            let unmerged = self.centroids[unmerged_index];
+            let existing = compressed[compressed_index];
+            if centroid_cmp(&unmerged, &existing) != Ordering::Greater {
+                self.centroids[output_index] = unmerged;
+                unmerged_index += 1;
+            } else {
+                self.centroids[output_index] = existing;
+                compressed_index += 1;
+            }
+            output_index += 1;
+        }
+        while compressed_index < compressed.len() {
+            self.centroids[output_index] = compressed[compressed_index];
+            compressed_index += 1;
+            output_index += 1;
+        }
+        debug_assert!(unmerged_index == len || output_index == unmerged_index);
+        debug_assert!(centroids_are_sorted(&self.centroids));
         self.centroids
     }
 
@@ -175,8 +219,8 @@ pub struct TDigestMut {
     max: f64,
 
     buffer: TDigestBuffer,
-    // Weight represented by the compressed prefix. The unmerged tail contributes one per
-    // centroid and is counted separately by `TDigestBuffer::unmerged_len`.
+    // Weight represented by the compressed prefix. The unmerged tail weight is tracked separately
+    // by `TDigestBuffer::unmerged_weight`.
     compressed_weight: u64,
 }
 
@@ -278,11 +322,52 @@ impl TDigestMut {
             return;
         }
 
+        self.update_nonzero(value, DEFAULT_WEIGHT);
+    }
+
+    /// Updates this t-digest with the given value and weight.
+    ///
+    /// A weight of zero is a no-op. [f64::NAN], [f64::INFINITY], and [f64::NEG_INFINITY] values
+    /// are ignored.
+    ///
+    /// The value is buffered as one weighted centroid. Quantile and rank estimates can therefore
+    /// differ from adding the same value repeatedly because compression and interpolation depend
+    /// on centroid grouping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if adding `weight` would overflow the total weight.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datasketches::tdigest::TDigestMut;
+    ///
+    /// let mut sketch = TDigestMut::new(100).unwrap();
+    /// sketch.update_with_weight(1.0, 3).unwrap();
+    /// assert_eq!(sketch.total_weight(), 3);
+    /// ```
+    pub fn update_with_weight(&mut self, value: f64, weight: u64) -> Result<(), Error> {
+        let Some(weight) = NonZeroU64::new(weight) else {
+            return Ok(());
+        };
+        if !value.is_finite() {
+            return Ok(());
+        }
+        self.total_weight()
+            .checked_add(weight.get())
+            .ok_or_else(|| Error::invalid_argument("t-digest total weight overflow"))?;
+
+        self.update_nonzero(value, weight);
+        Ok(())
+    }
+
+    fn update_nonzero(&mut self, value: f64, weight: NonZeroU64) {
         let max_unmerged = self.max_unmerged();
         if self.buffer.unmerged_len() >= max_unmerged {
             self.compress();
         }
-        self.buffer.push_unmerged(value, max_unmerged);
+        self.buffer.push_unmerged(value, weight, max_unmerged);
         self.min = self.min.min(value);
         self.max = self.max.max(value);
     }
@@ -317,7 +402,7 @@ impl TDigestMut {
 
     /// Returns the total weight.
     pub fn total_weight(&self) -> u64 {
-        self.compressed_weight + self.buffer.unmerged_len() as u64
+        self.compressed_weight + self.buffer.unmerged_weight()
     }
 
     /// Merges the given t-digest into this one.
@@ -339,7 +424,7 @@ impl TDigestMut {
             return;
         }
 
-        let self_unmerged_weight = self.buffer.unmerged_len() as u64;
+        let self_unmerged_weight = self.buffer.unmerged_weight();
         let centroids = std::mem::take(&mut self.buffer).into_merged_centroids(&other.buffer);
         self.compress_sorted_centroids(centroids, self_unmerged_weight + other.total_weight())
     }
@@ -646,6 +731,7 @@ impl TDigestMut {
                         weight: DEFAULT_WEIGHT,
                     }],
                     0,
+                    0,
                 ),
                 1,
             ));
@@ -751,7 +837,7 @@ impl TDigestMut {
             reverse_merge,
             min,
             max,
-            TDigestBuffer::new(centroids, num_buffered),
+            TDigestBuffer::new(centroids, num_buffered, num_buffered as u64),
             compressed_weight,
         ))
     }
@@ -813,7 +899,7 @@ impl TDigestMut {
                     false,
                     min,
                     max,
-                    TDigestBuffer::new(centroids, 0),
+                    TDigestBuffer::new(centroids, 0, 0),
                     total_weight,
                 ))
             }
@@ -867,7 +953,7 @@ impl TDigestMut {
                     false,
                     min,
                     max,
-                    TDigestBuffer::new(centroids, 0),
+                    TDigestBuffer::new(centroids, 0, 0),
                     total_weight,
                 ))
             }
@@ -877,28 +963,12 @@ impl TDigestMut {
 
     /// Processes unmerged values and merges centroids if needed.
     fn compress(&mut self) {
-        let additional_weight = self.buffer.unmerged_len() as u64;
+        let additional_weight = self.buffer.unmerged_weight();
         if additional_weight == 0 {
             // Also preserves fully compressed deserialized images verbatim.
             return;
         }
-        let centroids = std::mem::take(&mut self.buffer).into_centroids_for_compression();
-        self.compress_centroids(centroids, additional_weight);
-    }
-
-    /// Compresses the given centroids into this t-digest.
-    ///
-    /// # Contract
-    ///
-    /// * `centroids` must contain at least one centroid.
-    /// * `centroids` contains every centroid to be merged, including all centroids previously
-    ///   stored in `self`.
-    /// * `additional_weight` is the total weight not yet included in `self.compressed_weight`.
-    /// * Every centroid mean in `centroids` is finite.
-    /// * `self.buffer` has no unmerged values before returning.
-    fn compress_centroids(&mut self, mut centroids: Vec<Centroid>, additional_weight: u64) {
-        debug_assert!(!centroids.is_empty());
-        centroids.sort_by(centroid_cmp);
+        let centroids = std::mem::take(&mut self.buffer).into_sorted_centroids_for_compression();
         self.compress_sorted_centroids(centroids, additional_weight);
     }
 
@@ -948,7 +1018,7 @@ impl TDigestMut {
         self.max = self.max.max(centroids[num_centroids - 1].mean);
         self.reverse_merge = !self.reverse_merge;
         self.reduce_retained_capacity(&mut centroids);
-        self.buffer = TDigestBuffer::new(centroids, 0);
+        self.buffer = TDigestBuffer::new(centroids, 0, 0);
     }
 
     fn reduce_retained_capacity(&self, centroids: &mut Vec<Centroid>) {
@@ -1288,7 +1358,7 @@ impl TDigest {
             self.reverse_merge,
             self.min,
             self.max,
-            TDigestBuffer::new(self.centroids, 0),
+            TDigestBuffer::new(self.centroids, 0, 0),
             self.centroids_weight,
         )
     }
@@ -1714,5 +1784,61 @@ fn weighted_average(x1: f64, w1: f64, x2: f64, w2: f64) -> f64 {
     } else {
         // Same-sign subtraction is finite and avoids summing two near-maximum terms.
         (x2 - x1).mul_add(ratio, x1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use super::Centroid;
+    use super::TDigestBuffer;
+    use super::centroid_cmp;
+
+    fn centroid(mean: f64, weight: u64) -> Centroid {
+        Centroid {
+            mean,
+            weight: NonZeroU64::new(weight).unwrap(),
+        }
+    }
+
+    #[test]
+    fn partial_sort_matches_stable_full_sort() {
+        let cases = [
+            (vec![(3., 1), (1., 2), (2., 3)], 0),
+            (
+                vec![
+                    (1., 10),
+                    (2., 20),
+                    (4., 40),
+                    (2., 1),
+                    (3., 2),
+                    (1., 3),
+                    (4., 4),
+                    (2., 5),
+                ],
+                3,
+            ),
+            (vec![(1., 10), (1., 20), (1., 1), (1., 2)], 2),
+        ];
+
+        for (values, compressed_prefix_len) in cases {
+            let centroids = values
+                .into_iter()
+                .map(|(mean, weight)| centroid(mean, weight))
+                .collect::<Vec<_>>();
+            let mut expected = centroids.clone();
+            expected.rotate_left(compressed_prefix_len);
+            expected.sort_by(centroid_cmp);
+            let unmerged_tail_len = centroids.len() - compressed_prefix_len;
+            let unmerged_weight = centroids[compressed_prefix_len..]
+                .iter()
+                .map(|centroid| centroid.weight.get())
+                .sum();
+
+            let actual = TDigestBuffer::new(centroids, unmerged_tail_len, unmerged_weight)
+                .into_sorted_centroids_for_compression();
+            assert_eq!(actual, expected);
+        }
     }
 }
